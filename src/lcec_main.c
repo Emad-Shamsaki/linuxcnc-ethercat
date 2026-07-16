@@ -119,18 +119,54 @@ void lcec_read_master(void *arg, long period);
 void lcec_write_master(void *arg, long period);
 static int lcec_activate_master(lcec_master_t *master);
 static void lcec_activate(void *arg, long period);
+static lcec_sync_unit_t *lcec_master_get_sync_unit(lcec_master_t *master, const char *name, uint32_t cycle_time);
+static int lcec_master_all_op(lcec_master_t *master);
 
 static void sigsegv_handler(int sig);
+
+static lcec_sync_unit_t *lcec_master_get_sync_unit(lcec_master_t *master, const char *name, uint32_t cycle_time) {
+  lcec_sync_unit_t *sync_unit;
+
+  if (cycle_time == 0 || master->app_time_period == 0 || (cycle_time % master->app_time_period) != 0) {
+    rtapi_print_msg(RTAPI_MSG_ERR,
+        LCEC_MSG_PFX "master %s syncUnit %s cycle %u is not a positive multiple of appTimePeriod %u\n", master->name, name, cycle_time,
+        master->app_time_period);
+    return NULL;
+  }
+
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    if (strncmp(sync_unit->name, name, LCEC_CONF_STR_MAXLEN) == 0) {
+      if (sync_unit->cycle_time != cycle_time) {
+        rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s syncUnit %s cycle mismatch (%u != %u)\n", master->name, name,
+            sync_unit->cycle_time, cycle_time);
+        return NULL;
+      }
+      return sync_unit;
+    }
+  }
+
+  sync_unit = LCEC_ALLOCATE(lcec_sync_unit_t);
+  strncpy(sync_unit->name, name, LCEC_CONF_STR_MAXLEN);
+  sync_unit->name[LCEC_CONF_STR_MAXLEN - 1] = 0;
+  sync_unit->cycle_time = cycle_time;
+  sync_unit->cycle_divider = cycle_time / master->app_time_period;
+  sync_unit->queued = 1;
+  LCEC_LIST_APPEND(master->first_sync_unit, master->last_sync_unit, sync_unit);
+
+  return sync_unit;
+}
+
+static int lcec_master_all_op(lcec_master_t *master) { return master->ms.al_states == 0x08; }
 
 /// @brief Main entrypoint from LinuxCNC
 int rtapi_app_main(void) {
   int slave_count;
   lcec_master_t *master;
   lcec_slave_t *slave;
+  lcec_sync_unit_t *sync_unit;
   char name[HAL_NAME_LEN + 1];
   lcec_slave_sdoconf_t *sdo_config;
   lcec_slave_idnconf_t *idn_config;
-  int pdo_entry_count = 0;
 
 #ifndef __KERNEL
   struct sigaction handler;
@@ -184,10 +220,16 @@ int rtapi_app_main(void) {
     ecrt_master_callbacks(master->master, lcec_request_lock, lcec_release_lock, master);
 #endif
 
-    // create domain
-    if (!(master->domain = ecrt_master_create_domain(master->master))) {
-      rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s domain creation failed\n", master->name);
-      goto fail2;
+    // create one process-data domain per Sync Unit
+    for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+      if (!(sync_unit->domain = ecrt_master_create_domain(master->master))) {
+        rtapi_print_msg(
+            RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s syncUnit %s domain creation failed\n", master->name, sync_unit->name);
+        goto fail2;
+      }
+      if (master->domain == NULL) {
+        master->domain = sync_unit->domain;
+      }
     }
 
     // initialize slaves
@@ -248,6 +290,13 @@ int rtapi_app_main(void) {
 
       // configure dc for this slave
       if (slave->dc_conf != NULL) {
+        if (slave->sync_unit->cycle_divider > 1 && slave->dc_conf->sync0Cycle > 0 &&
+            slave->dc_conf->sync0Cycle != slave->sync_unit->cycle_time) {
+          rtapi_print_msg(RTAPI_MSG_WARN,
+              LCEC_MSG_PFX "slave %s.%s syncUnit %s cycle=%u ns but DC sync0Cycle=%u ns; set dcConf sync0Cycle to the slave "
+                           "hardware cycle or keep this slave in a matching syncUnit\n",
+              master->name, slave->name, slave->sync_unit->name, slave->sync_unit->cycle_time, slave->dc_conf->sync0Cycle);
+        }
         ecrt_slave_config_dc(slave->config, slave->dc_conf->assignActivate, slave->dc_conf->sync0Cycle, slave->dc_conf->sync0Shift,
             slave->dc_conf->sync1Cycle, slave->dc_conf->sync1Shift);
         rtapi_print_msg(RTAPI_MSG_DBG,
@@ -277,22 +326,31 @@ int rtapi_app_main(void) {
         goto fail2;
       }
 
-      pdo_entry_count += lcec_pdo_entry_reg_len(slave->regs);
+      slave->sync_unit->pdo_entry_count += lcec_pdo_entry_reg_len(slave->regs);
     }
 
-    lcec_pdo_entry_reg_t *master_regs = lcec_allocate_pdo_entry_reg(pdo_entry_count + 1);
-    for (slave = master->first_slave; slave != NULL; slave = slave->next) {
-      if (lcec_append_pdo_entry_reg(master_regs, slave->regs) < 0) {
-        rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failure to append PDO entries for slave %s.%s\n", master->name, slave->name);
+    // collect and register PDO entries separately for every Sync Unit/domain
+    for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+      sync_unit->regs = lcec_allocate_pdo_entry_reg(sync_unit->pdo_entry_count + 1);
+      if (sync_unit->regs == NULL) {
+        rtapi_print_msg(
+            RTAPI_MSG_ERR, LCEC_MSG_PFX "failure allocating PDO entries for syncUnit %s.%s\n", master->name, sync_unit->name);
         goto fail2;
       }
-    }
 
-    // register PDO entries
-    rtapi_print_msg(RTAPI_MSG_DBG, LCEC_MSG_PFX "register PDO entries\n");
-    if (ecrt_domain_reg_pdo_entry_list(master->domain, master_regs->pdo_entry_regs)) {
-      rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s PDO entry registration failed\n", master->name);
-      goto fail2;
+      for (slave = master->first_slave; slave != NULL; slave = slave->next) {
+        if (slave->sync_unit == sync_unit && lcec_append_pdo_entry_reg(sync_unit->regs, slave->regs) < 0) {
+          rtapi_print_msg(RTAPI_MSG_ERR, LCEC_MSG_PFX "failure to append PDO entries for slave %s.%s\n", master->name, slave->name);
+          goto fail2;
+        }
+      }
+
+      rtapi_print_msg(RTAPI_MSG_DBG, LCEC_MSG_PFX "register PDO entries for syncUnit %s.%s\n", master->name, sync_unit->name);
+      if (ecrt_domain_reg_pdo_entry_list(sync_unit->domain, sync_unit->regs->pdo_entry_regs)) {
+        rtapi_print_msg(
+            RTAPI_MSG_ERR, LCEC_MSG_PFX "master %s syncUnit %s PDO entry registration failed\n", master->name, sync_unit->name);
+        goto fail2;
+      }
     }
 
     // init hal data
@@ -535,7 +593,15 @@ int lcec_parse_config(void) {
         slave->index = slave_conf->index;
         strncpy(slave->name, slave_conf->name, LCEC_CONF_STR_MAXLEN);
         slave->name[LCEC_CONF_STR_MAXLEN - 1] = 0;
+        strncpy(slave->sync_unit_name, slave_conf->syncUnit, LCEC_CONF_STR_MAXLEN);
+        slave->sync_unit_name[LCEC_CONF_STR_MAXLEN - 1] = 0;
+        slave->sync_unit_cycle = slave_conf->syncUnitCycle;
         slave->master = master;
+
+        slave->sync_unit = lcec_master_get_sync_unit(master, slave->sync_unit_name, slave->sync_unit_cycle);
+        if (slave->sync_unit == NULL) {
+          goto fail2;
+        }
 
         // add slave to list
         LCEC_LIST_APPEND(master->first_slave, master->last_slave, slave);
@@ -1108,6 +1174,7 @@ static void lcec_activate(void *arg, long period) {
 /// minimizing the delay between activation and cyclic communication.
 static int lcec_activate_master(lcec_master_t *master) {
   struct timeval tv;
+  lcec_sync_unit_t *sync_unit;
   
   uint64_t initial_app_time;
   
@@ -1157,9 +1224,17 @@ static int lcec_activate_master(lcec_master_t *master) {
     return -1;
   }
   
-  // Get internal process data for domain
-  master->process_data = ecrt_domain_data(master->domain);
-  master->process_data_len = ecrt_domain_size(master->domain);
+  // Get internal process data for every Sync Unit domain.
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    sync_unit->process_data = ecrt_domain_data(sync_unit->domain);
+    sync_unit->process_data_len = ecrt_domain_size(sync_unit->domain);
+    if (master->process_data == NULL) {
+      master->process_data = sync_unit->process_data;
+      master->process_data_len = sync_unit->process_data_len;
+    }
+    rtapi_print_msg(RTAPI_MSG_DBG, LCEC_MSG_PFX "master %s syncUnit %s cycle=%u ns divider=%u process_data_len=%d\n", master->name,
+        sync_unit->name, sync_unit->cycle_time, sync_unit->cycle_divider, sync_unit->process_data_len);
+  }
   
   master->activated = 1;
   rtapi_print_msg(RTAPI_MSG_INFO, LCEC_MSG_PFX "Master %s activated successfully\n", master->name);
@@ -1171,6 +1246,7 @@ static int lcec_activate_master(lcec_master_t *master) {
 void lcec_read_master(void *arg, long period) {
   lcec_master_t *master = (lcec_master_t *)arg;
   lcec_slave_t *slave;
+  lcec_sync_unit_t *sync_unit;
   int check_states;
 
   // Master not yet activated: process_data is NULL until lcec_activate_master()
@@ -1201,7 +1277,10 @@ void lcec_read_master(void *arg, long period) {
   }
 
   // get state check flag
-  if (master->state_update_timer > 0) {
+  if (!master->sync_units_started) {
+    check_states = 1;
+    master->state_update_timer = 0;
+  } else if (master->state_update_timer > 0) {
     check_states = 0;
     master->state_update_timer -= period;
   } else {
@@ -1212,9 +1291,18 @@ void lcec_read_master(void *arg, long period) {
   // receive process data & master state
   rtapi_mutex_get(&master->mutex);
   ecrt_master_receive(master->master);
-  ecrt_domain_process(master->domain);
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    sync_unit->process = sync_unit->queued;
+    if (sync_unit->process) {
+      ecrt_domain_process(sync_unit->domain);
+      sync_unit->queued = 0;
+    }
+  }
   if (check_states) {
     ecrt_master_state(master->master, &master->ms);
+  }
+  if (!master->sync_units_started && lcec_master_all_op(master)) {
+    master->sync_units_started = 1;
   }
   rtapi_mutex_give(&master->mutex);
 
@@ -1239,8 +1327,10 @@ void lcec_read_master(void *arg, long period) {
     }
 
     // process read function
-    if (slave->proc_read != NULL) {
-      slave->proc_read(slave, period);
+    if (slave->sync_unit->process && slave->proc_read != NULL) {
+      master->process_data = slave->sync_unit->process_data;
+      master->process_data_len = slave->sync_unit->process_data_len;
+      slave->proc_read(slave, slave->sync_unit->cycle_time);
     }
   }
 }
@@ -1249,6 +1339,8 @@ void lcec_read_master(void *arg, long period) {
 void lcec_write_master(void *arg, long period) {
   lcec_master_t *master = (lcec_master_t *)arg;
   lcec_slave_t *slave;
+  lcec_sync_unit_t *sync_unit;
+  int force_cycle;
   uint64_t app_time;
   long long now;
 #ifdef RTAPI_TASK_PLL_SUPPORT
@@ -1276,10 +1368,28 @@ void lcec_write_master(void *arg, long period) {
     }
   }
 
+  // Keep all domains cycling during startup. Once OP has been reached, run
+  // each Sync Unit at its configured integer divider.
+  force_cycle = !master->sync_units_started;
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    if (force_cycle) {
+      sync_unit->write = 1;
+      sync_unit->cycle_counter = 0;
+    } else if (sync_unit->cycle_counter == 0) {
+      sync_unit->write = 1;
+      sync_unit->cycle_counter = sync_unit->cycle_divider - 1;
+    } else {
+      sync_unit->write = 0;
+      sync_unit->cycle_counter--;
+    }
+  }
+
   // process slaves
   for (slave = master->first_slave; slave != NULL; slave = slave->next) {
-    if (slave->proc_write != NULL) {
-      slave->proc_write(slave, period);
+    if (slave->sync_unit->write && slave->proc_write != NULL) {
+      master->process_data = slave->sync_unit->process_data;
+      master->process_data_len = slave->sync_unit->process_data_len;
+      slave->proc_write(slave, slave->sync_unit->cycle_time);
     }
   }
 
@@ -1290,7 +1400,12 @@ void lcec_write_master(void *arg, long period) {
 
   // send process data
   rtapi_mutex_get(&master->mutex);
-  ecrt_domain_queue(master->domain);
+  for (sync_unit = master->first_sync_unit; sync_unit != NULL; sync_unit = sync_unit->next) {
+    if (sync_unit->write) {
+      ecrt_domain_queue(sync_unit->domain);
+      sync_unit->queued = 1;
+    }
+  }
 
   // update application time
   now = rtapi_get_time();
